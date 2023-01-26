@@ -1,7 +1,10 @@
 use clap::Parser;
 use stackable_hdfs_crd::constants::APP_NAME;
-use stackable_hdfs_crd::HdfsCluster;
+use stackable_hdfs_crd::v1::HdfsCluster;
+use stackable_hdfs_crd::{v1, v2};
 use stackable_hdfs_operator::OPERATOR_NAME;
+use stackable_operator::k8s_openapi::ByteString;
+use stackable_operator::kube::core::crd::merge_crds;
 use stackable_operator::{
     cli::{Command, ProductOperatorRun},
     client, CustomResourceExt,
@@ -23,7 +26,7 @@ struct Opts {
 async fn main() -> anyhow::Result<()> {
     let opts = Opts::parse();
     match opts.cmd {
-        Command::Crd => HdfsCluster::print_yaml_schema()?,
+        Command::Crd => print_crd_schema(),
         Command::Run(ProductOperatorRun {
             product_config,
             watch_namespace,
@@ -54,4 +57,40 @@ async fn main() -> anyhow::Result<()> {
     };
 
     Ok(())
+}
+
+fn print_crd_schema() {
+    use serde::{Deserialize, Serialize};
+    use stackable_hdfs_crd;
+    use stackable_operator::k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
+        CustomResourceConversion, ServiceReference, WebhookClientConfig, WebhookConversion,
+    };
+    use stackable_operator::kube::CustomResourceExt;
+
+    let crd_v1 = v1::HdfsCluster::crd();
+    let crd_v2 = v2::HdfsCluster::crd();
+
+    let crd_all_versions = vec![crd_v1.clone(), crd_v2.clone()];
+
+    // apply schema where v1 is the stored version
+    let mut bla = merge_crds(crd_all_versions.clone(), "v1alpha1").unwrap();
+
+    bla.spec.conversion = Some(CustomResourceConversion {
+        strategy: "Webhook".to_string(),
+        webhook: Some(WebhookConversion {
+            client_config: Some(WebhookClientConfig {
+                ca_bundle: None,
+                service: Some(ServiceReference {
+                    name: "hdfs-operator".to_string(),
+                    namespace: "default".to_string(),
+                    path: Some("/convert".to_string()),
+                    port: Some(1234),
+                }),
+                url: None,
+            }),
+            conversion_review_versions: vec!["v1".to_string()],
+        }),
+    });
+
+    println!("{}", serde_yaml::to_string(&bla).unwrap());
 }

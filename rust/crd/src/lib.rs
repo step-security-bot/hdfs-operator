@@ -33,6 +33,7 @@ use storage::{
     HdfsStorageConfigFragment, HdfsStorageType,
 };
 use strum::{Display, EnumIter, EnumString};
+use v1::HdfsCluster;
 
 #[derive(Snafu, Debug)]
 pub enum Error {
@@ -46,37 +47,466 @@ pub enum Error {
     FragmentValidationFailure { source: ValidationError },
 }
 
-#[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[kube(
-    group = "hdfs.stackable.tech",
-    version = "v1alpha1",
-    kind = "HdfsCluster",
-    plural = "hdfsclusters",
-    shortname = "hdfs",
-    namespaced,
-    crates(
-        kube_core = "stackable_operator::kube::core",
-        k8s_openapi = "stackable_operator::k8s_openapi",
-        schemars = "stackable_operator::schemars"
-    )
-)]
-#[serde(rename_all = "camelCase")]
-pub struct HdfsClusterSpec {
-    pub image: ProductImage,
-    pub auto_format_fs: Option<bool>,
-    pub dfs_replication: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name_nodes: Option<Role<NameNodeConfigFragment>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data_nodes: Option<Role<DataNodeConfigFragment>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub journal_nodes: Option<Role<JournalNodeConfigFragment>>,
-    /// Name of the Vector aggregator discovery ConfigMap.
-    /// It must contain the key `ADDRESS` with the address of the Vector aggregator.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vector_aggregator_config_map_name: Option<String>,
-    /// Name of the ZooKeeper discovery config map.
-    pub zookeeper_config_map_name: String,
+pub mod v1 {
+    use super::*;
+
+    #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+    #[kube(
+        group = "hdfs.stackable.tech",
+        version = "v1alpha1",
+        kind = "HdfsCluster",
+        plural = "hdfsclusters",
+        shortname = "hdfs",
+        namespaced,
+        crates(
+            kube_core = "stackable_operator::kube::core",
+            k8s_openapi = "stackable_operator::k8s_openapi",
+            schemars = "stackable_operator::schemars"
+        )
+    )]
+    #[serde(rename_all = "camelCase")]
+    pub struct HdfsClusterSpec {
+        pub image: ProductImage,
+        pub auto_format_fs: Option<bool>,
+        pub dfs_replication: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name_nodes: Option<Role<NameNodeConfigFragment>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub data_nodes: Option<Role<DataNodeConfigFragment>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub journal_nodes: Option<Role<JournalNodeConfigFragment>>,
+        /// Name of the Vector aggregator discovery ConfigMap.
+        /// It must contain the key `ADDRESS` with the address of the Vector aggregator.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub vector_aggregator_config_map_name: Option<String>,
+        /// Name of the ZooKeeper discovery config map.
+        pub zookeeper_config_map_name: String,
+    }
+
+    impl HdfsCluster {
+        /// Kubernetes labels to attach to Pods within a role group.
+        ///
+        /// The same labels are also used as selectors for Services and StatefulSets.
+        pub fn rolegroup_selector_labels(
+            &self,
+            rolegroup_ref: &RoleGroupRef<HdfsCluster>,
+        ) -> BTreeMap<String, String> {
+            let mut group_labels = role_group_selector_labels(
+                self,
+                APP_NAME,
+                &rolegroup_ref.role,
+                &rolegroup_ref.role_group,
+            );
+            group_labels.insert(String::from("role"), rolegroup_ref.role.clone());
+            group_labels.insert(String::from("group"), rolegroup_ref.role_group.clone());
+            // TODO: in a production environment, probably not all roles need to be exposed with one NodePort per Pod but it's
+            // useful for development purposes.
+            group_labels.insert(LABEL_ENABLE.to_string(), "true".to_string());
+
+            group_labels
+        }
+
+        /// Get a reference to the namenode [`RoleGroup`] struct if it exists.
+        pub fn namenode_rolegroup(
+            &self,
+            role_group: &str,
+        ) -> Option<&RoleGroup<NameNodeConfigFragment>> {
+            self.spec.name_nodes.as_ref()?.role_groups.get(role_group)
+        }
+
+        /// Get a reference to the datanode [`RoleGroup`] struct if it exists.
+        pub fn datanode_rolegroup(
+            &self,
+            role_group: &str,
+        ) -> Option<&RoleGroup<DataNodeConfigFragment>> {
+            self.spec.data_nodes.as_ref()?.role_groups.get(role_group)
+        }
+
+        /// Get a reference to the journalnode [`RoleGroup`] struct if it exists.
+        pub fn journalnode_rolegroup(
+            &self,
+            role_group: &str,
+        ) -> Option<&RoleGroup<JournalNodeConfigFragment>> {
+            self.spec
+                .journal_nodes
+                .as_ref()?
+                .role_groups
+                .get(role_group)
+        }
+
+        pub fn rolegroup_ref(
+            &self,
+            role_name: impl Into<String>,
+            group_name: impl Into<String>,
+        ) -> RoleGroupRef<HdfsCluster> {
+            RoleGroupRef {
+                cluster: ObjectRef::from_obj(self),
+                role: role_name.into(),
+                role_group: group_name.into(),
+            }
+        }
+
+        /// List all [HdfsPodRef]s expected for the given `role`
+        ///
+        /// The `validated_config` is used to extract the ports exposed by the pods.
+        pub fn pod_refs(&self, role: &HdfsRole) -> Result<Vec<HdfsPodRef>, Error> {
+            let ns = self.metadata.namespace.clone().context(NoNamespaceSnafu)?;
+
+            let rolegroup_ref_and_replicas = self.rolegroup_ref_and_replicas(role);
+
+            Ok(rolegroup_ref_and_replicas
+                .iter()
+                .flat_map(|(rolegroup_ref, replicas)| {
+                    let ns = ns.clone();
+                    (0..*replicas).map(move |i| HdfsPodRef {
+                        namespace: ns.clone(),
+                        role_group_service_name: rolegroup_ref.object_name(),
+                        pod_name: format!("{}-{}", rolegroup_ref.object_name(), i),
+                        ports: role.ports().iter().map(|(n, p)| (n.clone(), *p)).collect(),
+                    })
+                })
+                .collect())
+        }
+
+        pub fn rolegroup_ref_and_replicas(
+            &self,
+            role: &HdfsRole,
+        ) -> Vec<(RoleGroupRef<HdfsCluster>, u16)> {
+            match role {
+                HdfsRole::NameNode => self
+                    .spec
+                    .name_nodes
+                    .iter()
+                    .flat_map(|role| &role.role_groups)
+                    // Order rolegroups consistently, to avoid spurious downstream rewrites
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .map(|(rolegroup_name, role_group)| {
+                        (
+                            self.rolegroup_ref(HdfsRole::NameNode.to_string(), rolegroup_name),
+                            role_group.replicas.unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
+                HdfsRole::DataNode => self
+                    .spec
+                    .data_nodes
+                    .iter()
+                    .flat_map(|role| &role.role_groups)
+                    // Order rolegroups consistently, to avoid spurious downstream rewrites
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .map(|(rolegroup_name, role_group)| {
+                        (
+                            self.rolegroup_ref(HdfsRole::DataNode.to_string(), rolegroup_name),
+                            role_group.replicas.unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
+                HdfsRole::JournalNode => self
+                    .spec
+                    .journal_nodes
+                    .iter()
+                    .flat_map(|role| &role.role_groups)
+                    // Order rolegroups consistently, to avoid spurious downstream rewrites
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .map(|(rolegroup_name, role_group)| {
+                        (
+                            self.rolegroup_ref(HdfsRole::JournalNode.to_string(), rolegroup_name),
+                            role_group.replicas.unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
+            }
+        }
+
+        pub fn build_role_properties(
+            &self,
+        ) -> Result<
+            HashMap<
+                String,
+                (
+                    Vec<PropertyNameKind>,
+                    Role<impl Configuration<Configurable = HdfsCluster>>,
+                ),
+            >,
+            Error,
+        > {
+            let mut result = HashMap::new();
+            let pnk = vec![
+                PropertyNameKind::File(HDFS_SITE_XML.to_string()),
+                PropertyNameKind::File(CORE_SITE_XML.to_string()),
+                PropertyNameKind::Env,
+            ];
+
+            if let Some(name_nodes) = &self.spec.name_nodes {
+                result.insert(
+                    HdfsRole::NameNode.to_string(),
+                    (pnk.clone(), name_nodes.clone().erase()),
+                );
+            } else {
+                return Err(Error::MissingRole {
+                    role: HdfsRole::NameNode.to_string(),
+                });
+            }
+
+            if let Some(data_nodes) = &self.spec.data_nodes {
+                result.insert(
+                    HdfsRole::DataNode.to_string(),
+                    (pnk.clone(), data_nodes.clone().erase()),
+                );
+            } else {
+                return Err(Error::MissingRole {
+                    role: HdfsRole::DataNode.to_string(),
+                });
+            }
+
+            if let Some(journal_nodes) = &self.spec.journal_nodes {
+                result.insert(
+                    HdfsRole::JournalNode.to_string(),
+                    (pnk, journal_nodes.clone().erase()),
+                );
+            } else {
+                return Err(Error::MissingRole {
+                    role: HdfsRole::JournalNode.to_string(),
+                });
+            }
+
+            Ok(result)
+        }
+    }
+}
+
+pub mod v2 {
+    use super::*;
+
+    #[derive(Clone, CustomResource, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+    #[kube(
+        group = "hdfs.stackable.tech",
+        version = "v2alpha1",
+        kind = "HdfsCluster",
+        plural = "hdfsclusters",
+        shortname = "hdfs",
+        namespaced,
+        crates(
+            kube_core = "stackable_operator::kube::core",
+            k8s_openapi = "stackable_operator::k8s_openapi",
+            schemars = "stackable_operator::schemars"
+        )
+    )]
+    #[serde(rename_all = "camelCase")]
+    pub struct HdfsClusterSpec {
+        pub image: ProductImage,
+        pub auto_format_fs: Option<bool>,
+        pub dfs_replication: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name_nodes: Option<Role<NameNodeConfigFragment>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub data_nodes: Option<Role<DataNodeConfigFragment>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub journal_nodes: Option<Role<JournalNodeConfigFragment>>,
+        /// Name of the Vector aggregator discovery ConfigMap.
+        /// It must contain the key `ADDRESS` with the address of the Vector aggregator.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub vector_aggregator_config_map_name: Option<String>,
+        /// Name of the ZooKeeper discovery config map.
+        pub zookeeper_config_map_name: String,
+    }
+
+    impl HdfsCluster {
+        /// Kubernetes labels to attach to Pods within a role group.
+        ///
+        /// The same labels are also used as selectors for Services and StatefulSets.
+        pub fn rolegroup_selector_labels(
+            &self,
+            rolegroup_ref: &RoleGroupRef<HdfsCluster>,
+        ) -> BTreeMap<String, String> {
+            let mut group_labels = role_group_selector_labels(
+                self,
+                APP_NAME,
+                &rolegroup_ref.role,
+                &rolegroup_ref.role_group,
+            );
+            group_labels.insert(String::from("role"), rolegroup_ref.role.clone());
+            group_labels.insert(String::from("group"), rolegroup_ref.role_group.clone());
+            // TODO: in a production environment, probably not all roles need to be exposed with one NodePort per Pod but it's
+            // useful for development purposes.
+            group_labels.insert(LABEL_ENABLE.to_string(), "true".to_string());
+
+            group_labels
+        }
+
+        /// Get a reference to the namenode [`RoleGroup`] struct if it exists.
+        pub fn namenode_rolegroup(
+            &self,
+            role_group: &str,
+        ) -> Option<&RoleGroup<NameNodeConfigFragment>> {
+            self.spec.name_nodes.as_ref()?.role_groups.get(role_group)
+        }
+
+        /// Get a reference to the datanode [`RoleGroup`] struct if it exists.
+        pub fn datanode_rolegroup(
+            &self,
+            role_group: &str,
+        ) -> Option<&RoleGroup<DataNodeConfigFragment>> {
+            self.spec.data_nodes.as_ref()?.role_groups.get(role_group)
+        }
+
+        /// Get a reference to the journalnode [`RoleGroup`] struct if it exists.
+        pub fn journalnode_rolegroup(
+            &self,
+            role_group: &str,
+        ) -> Option<&RoleGroup<JournalNodeConfigFragment>> {
+            self.spec
+                .journal_nodes
+                .as_ref()?
+                .role_groups
+                .get(role_group)
+        }
+
+        pub fn rolegroup_ref(
+            &self,
+            role_name: impl Into<String>,
+            group_name: impl Into<String>,
+        ) -> RoleGroupRef<HdfsCluster> {
+            RoleGroupRef {
+                cluster: ObjectRef::from_obj(self),
+                role: role_name.into(),
+                role_group: group_name.into(),
+            }
+        }
+
+        /// List all [HdfsPodRef]s expected for the given `role`
+        ///
+        /// The `validated_config` is used to extract the ports exposed by the pods.
+        pub fn pod_refs(&self, role: &HdfsRole) -> Result<Vec<HdfsPodRef>, Error> {
+            let ns = self.metadata.namespace.clone().context(NoNamespaceSnafu)?;
+
+            let rolegroup_ref_and_replicas = self.rolegroup_ref_and_replicas(role);
+
+            Ok(rolegroup_ref_and_replicas
+                .iter()
+                .flat_map(|(rolegroup_ref, replicas)| {
+                    let ns = ns.clone();
+                    (0..*replicas).map(move |i| HdfsPodRef {
+                        namespace: ns.clone(),
+                        role_group_service_name: rolegroup_ref.object_name(),
+                        pod_name: format!("{}-{}", rolegroup_ref.object_name(), i),
+                        ports: role.ports().iter().map(|(n, p)| (n.clone(), *p)).collect(),
+                    })
+                })
+                .collect())
+        }
+
+        pub fn rolegroup_ref_and_replicas(
+            &self,
+            role: &HdfsRole,
+        ) -> Vec<(RoleGroupRef<HdfsCluster>, u16)> {
+            match role {
+                HdfsRole::NameNode => self
+                    .spec
+                    .name_nodes
+                    .iter()
+                    .flat_map(|role| &role.role_groups)
+                    // Order rolegroups consistently, to avoid spurious downstream rewrites
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .map(|(rolegroup_name, role_group)| {
+                        (
+                            self.rolegroup_ref(HdfsRole::NameNode.to_string(), rolegroup_name),
+                            role_group.replicas.unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
+                HdfsRole::DataNode => self
+                    .spec
+                    .data_nodes
+                    .iter()
+                    .flat_map(|role| &role.role_groups)
+                    // Order rolegroups consistently, to avoid spurious downstream rewrites
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .map(|(rolegroup_name, role_group)| {
+                        (
+                            self.rolegroup_ref(HdfsRole::DataNode.to_string(), rolegroup_name),
+                            role_group.replicas.unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
+                HdfsRole::JournalNode => self
+                    .spec
+                    .journal_nodes
+                    .iter()
+                    .flat_map(|role| &role.role_groups)
+                    // Order rolegroups consistently, to avoid spurious downstream rewrites
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .map(|(rolegroup_name, role_group)| {
+                        (
+                            self.rolegroup_ref(HdfsRole::JournalNode.to_string(), rolegroup_name),
+                            role_group.replicas.unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
+            }
+        }
+
+        pub fn build_role_properties(
+            &self,
+        ) -> Result<
+            HashMap<
+                String,
+                (
+                    Vec<PropertyNameKind>,
+                    Role<impl Configuration<Configurable = v1::HdfsCluster>>,
+                ),
+            >,
+            Error,
+        > {
+            let mut result = HashMap::new();
+            let pnk = vec![
+                PropertyNameKind::File(HDFS_SITE_XML.to_string()),
+                PropertyNameKind::File(CORE_SITE_XML.to_string()),
+                PropertyNameKind::Env,
+            ];
+
+            if let Some(name_nodes) = &self.spec.name_nodes {
+                result.insert(
+                    HdfsRole::NameNode.to_string(),
+                    (pnk.clone(), name_nodes.clone().erase()),
+                );
+            } else {
+                return Err(Error::MissingRole {
+                    role: HdfsRole::NameNode.to_string(),
+                });
+            }
+
+            if let Some(data_nodes) = &self.spec.data_nodes {
+                result.insert(
+                    HdfsRole::DataNode.to_string(),
+                    (pnk.clone(), data_nodes.clone().erase()),
+                );
+            } else {
+                return Err(Error::MissingRole {
+                    role: HdfsRole::DataNode.to_string(),
+                });
+            }
+
+            if let Some(journal_nodes) = &self.spec.journal_nodes {
+                result.insert(
+                    HdfsRole::JournalNode.to_string(),
+                    (pnk, journal_nodes.clone().erase()),
+                );
+            } else {
+                return Err(Error::MissingRole {
+                    role: HdfsRole::JournalNode.to_string(),
+                });
+            }
+
+            Ok(result)
+        }
+    }
 }
 
 /// This is a shared trait for all role/role-group config structs to avoid duplication
@@ -369,199 +799,6 @@ impl HdfsRole {
     }
 }
 
-impl HdfsCluster {
-    /// Kubernetes labels to attach to Pods within a role group.
-    ///
-    /// The same labels are also used as selectors for Services and StatefulSets.
-    pub fn rolegroup_selector_labels(
-        &self,
-        rolegroup_ref: &RoleGroupRef<HdfsCluster>,
-    ) -> BTreeMap<String, String> {
-        let mut group_labels = role_group_selector_labels(
-            self,
-            APP_NAME,
-            &rolegroup_ref.role,
-            &rolegroup_ref.role_group,
-        );
-        group_labels.insert(String::from("role"), rolegroup_ref.role.clone());
-        group_labels.insert(String::from("group"), rolegroup_ref.role_group.clone());
-        // TODO: in a production environment, probably not all roles need to be exposed with one NodePort per Pod but it's
-        // useful for development purposes.
-        group_labels.insert(LABEL_ENABLE.to_string(), "true".to_string());
-
-        group_labels
-    }
-
-    /// Get a reference to the namenode [`RoleGroup`] struct if it exists.
-    pub fn namenode_rolegroup(
-        &self,
-        role_group: &str,
-    ) -> Option<&RoleGroup<NameNodeConfigFragment>> {
-        self.spec.name_nodes.as_ref()?.role_groups.get(role_group)
-    }
-
-    /// Get a reference to the datanode [`RoleGroup`] struct if it exists.
-    pub fn datanode_rolegroup(
-        &self,
-        role_group: &str,
-    ) -> Option<&RoleGroup<DataNodeConfigFragment>> {
-        self.spec.data_nodes.as_ref()?.role_groups.get(role_group)
-    }
-
-    /// Get a reference to the journalnode [`RoleGroup`] struct if it exists.
-    pub fn journalnode_rolegroup(
-        &self,
-        role_group: &str,
-    ) -> Option<&RoleGroup<JournalNodeConfigFragment>> {
-        self.spec
-            .journal_nodes
-            .as_ref()?
-            .role_groups
-            .get(role_group)
-    }
-
-    pub fn rolegroup_ref(
-        &self,
-        role_name: impl Into<String>,
-        group_name: impl Into<String>,
-    ) -> RoleGroupRef<HdfsCluster> {
-        RoleGroupRef {
-            cluster: ObjectRef::from_obj(self),
-            role: role_name.into(),
-            role_group: group_name.into(),
-        }
-    }
-
-    /// List all [HdfsPodRef]s expected for the given `role`
-    ///
-    /// The `validated_config` is used to extract the ports exposed by the pods.
-    pub fn pod_refs(&self, role: &HdfsRole) -> Result<Vec<HdfsPodRef>, Error> {
-        let ns = self.metadata.namespace.clone().context(NoNamespaceSnafu)?;
-
-        let rolegroup_ref_and_replicas = self.rolegroup_ref_and_replicas(role);
-
-        Ok(rolegroup_ref_and_replicas
-            .iter()
-            .flat_map(|(rolegroup_ref, replicas)| {
-                let ns = ns.clone();
-                (0..*replicas).map(move |i| HdfsPodRef {
-                    namespace: ns.clone(),
-                    role_group_service_name: rolegroup_ref.object_name(),
-                    pod_name: format!("{}-{}", rolegroup_ref.object_name(), i),
-                    ports: role.ports().iter().map(|(n, p)| (n.clone(), *p)).collect(),
-                })
-            })
-            .collect())
-    }
-
-    pub fn rolegroup_ref_and_replicas(
-        &self,
-        role: &HdfsRole,
-    ) -> Vec<(RoleGroupRef<HdfsCluster>, u16)> {
-        match role {
-            HdfsRole::NameNode => self
-                .spec
-                .name_nodes
-                .iter()
-                .flat_map(|role| &role.role_groups)
-                // Order rolegroups consistently, to avoid spurious downstream rewrites
-                .collect::<BTreeMap<_, _>>()
-                .into_iter()
-                .map(|(rolegroup_name, role_group)| {
-                    (
-                        self.rolegroup_ref(HdfsRole::NameNode.to_string(), rolegroup_name),
-                        role_group.replicas.unwrap_or_default(),
-                    )
-                })
-                .collect(),
-            HdfsRole::DataNode => self
-                .spec
-                .data_nodes
-                .iter()
-                .flat_map(|role| &role.role_groups)
-                // Order rolegroups consistently, to avoid spurious downstream rewrites
-                .collect::<BTreeMap<_, _>>()
-                .into_iter()
-                .map(|(rolegroup_name, role_group)| {
-                    (
-                        self.rolegroup_ref(HdfsRole::DataNode.to_string(), rolegroup_name),
-                        role_group.replicas.unwrap_or_default(),
-                    )
-                })
-                .collect(),
-            HdfsRole::JournalNode => self
-                .spec
-                .journal_nodes
-                .iter()
-                .flat_map(|role| &role.role_groups)
-                // Order rolegroups consistently, to avoid spurious downstream rewrites
-                .collect::<BTreeMap<_, _>>()
-                .into_iter()
-                .map(|(rolegroup_name, role_group)| {
-                    (
-                        self.rolegroup_ref(HdfsRole::JournalNode.to_string(), rolegroup_name),
-                        role_group.replicas.unwrap_or_default(),
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    pub fn build_role_properties(
-        &self,
-    ) -> Result<
-        HashMap<
-            String,
-            (
-                Vec<PropertyNameKind>,
-                Role<impl Configuration<Configurable = HdfsCluster>>,
-            ),
-        >,
-        Error,
-    > {
-        let mut result = HashMap::new();
-        let pnk = vec![
-            PropertyNameKind::File(HDFS_SITE_XML.to_string()),
-            PropertyNameKind::File(CORE_SITE_XML.to_string()),
-            PropertyNameKind::Env,
-        ];
-
-        if let Some(name_nodes) = &self.spec.name_nodes {
-            result.insert(
-                HdfsRole::NameNode.to_string(),
-                (pnk.clone(), name_nodes.clone().erase()),
-            );
-        } else {
-            return Err(Error::MissingRole {
-                role: HdfsRole::NameNode.to_string(),
-            });
-        }
-
-        if let Some(data_nodes) = &self.spec.data_nodes {
-            result.insert(
-                HdfsRole::DataNode.to_string(),
-                (pnk.clone(), data_nodes.clone().erase()),
-            );
-        } else {
-            return Err(Error::MissingRole {
-                role: HdfsRole::DataNode.to_string(),
-            });
-        }
-
-        if let Some(journal_nodes) = &self.spec.journal_nodes {
-            result.insert(
-                HdfsRole::JournalNode.to_string(),
-                (pnk, journal_nodes.clone().erase()),
-            );
-        } else {
-            return Err(Error::MissingRole {
-                role: HdfsRole::JournalNode.to_string(),
-            });
-        }
-
-        Ok(result)
-    }
-}
 /// Reference to a single `Pod` that is a component of a [`HdfsCluster`]
 ///
 /// Used for service discovery.
@@ -996,7 +1233,7 @@ impl Configuration for JournalNodeConfigFragment {
 mod test {
     use crate::storage::HdfsStorageType;
 
-    use super::{HdfsCluster, HdfsRole};
+    use super::v1::{HdfsCluster, HdfsRole};
     use stackable_operator::k8s_openapi::{
         api::core::v1::ResourceRequirements, apimachinery::pkg::api::resource::Quantity,
     };

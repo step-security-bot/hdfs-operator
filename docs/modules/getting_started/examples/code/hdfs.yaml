@@ -13,10 +13,25 @@ spec:
     roleGroups:
       default:
         replicas: 2
+        configOverrides:
+          hdfs-site.xml:
+            dfs.namenode.heartbeat.recheck-interval: "5000"
+            dfs.heartbeat:.interval: "1"
   dataNodes:
     roleGroups:
       default:
         replicas: 1
+        config:
+          resources:
+            storage:
+              data:
+                count: 2
+                capacity: 1Gi
+                hdfsStorageType: Disk
+              id-backup:
+                count: 1
+                capacity: 10Mi
+                hdfsStorageType: Archive
   journalNodes:
     roleGroups:
       default:
