@@ -9,7 +9,7 @@ use crate::{
 };
 
 use snafu::{OptionExt, ResultExt, Snafu};
-use stackable_hdfs_crd::v1::HdfsCluster;
+use stackable_hdfs_crd::HdfsCluster;
 use stackable_hdfs_crd::{constants::*, HdfsPodRef, HdfsRole, MergedConfig};
 use stackable_operator::{
     builder::{ConfigMapBuilder, ObjectMetaBuilder, PodBuilder, PodSecurityContextBuilder},

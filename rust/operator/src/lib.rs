@@ -6,12 +6,13 @@ mod hdfs_controller;
 mod pod_svc_controller;
 mod product_logging;
 mod rbac;
+pub mod webhook;
 
 use std::sync::Arc;
 
 use futures::StreamExt;
 use stackable_hdfs_crd::constants::*;
-use stackable_hdfs_crd::v1::HdfsCluster;
+use stackable_hdfs_crd::HdfsCluster;
 use stackable_operator::client::Client;
 use stackable_operator::k8s_openapi::api::apps::v1::StatefulSet;
 use stackable_operator::k8s_openapi::api::core::v1::Pod;

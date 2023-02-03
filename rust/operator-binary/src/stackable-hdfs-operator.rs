@@ -1,6 +1,6 @@
 use clap::Parser;
 use stackable_hdfs_crd::constants::APP_NAME;
-use stackable_hdfs_crd::v1::HdfsCluster;
+use stackable_hdfs_crd::HdfsCluster;
 use stackable_hdfs_crd::{v1, v2};
 use stackable_hdfs_operator::OPERATOR_NAME;
 use stackable_operator::k8s_openapi::ByteString;
@@ -9,6 +9,7 @@ use stackable_operator::{
     cli::{Command, ProductOperatorRun},
     client, CustomResourceExt,
 };
+use tokio::sync::futures;
 
 mod built_info {
     // The file has been placed there by the build script.
@@ -51,8 +52,14 @@ async fn main() -> anyhow::Result<()> {
                 "/etc/stackable/hdfs-operator/config-spec/properties.yaml",
             ])?;
             let client = client::create_client(Some(OPERATOR_NAME.to_string())).await?;
-            stackable_hdfs_operator::create_controller(client, product_config, watch_namespace)
-                .await;
+
+            let hdfs_controller =
+                stackable_hdfs_operator::create_controller(client, product_config, watch_namespace);
+            let conversion_webhook = stackable_hdfs_operator::webhook::start(&client);
+
+            pin_mut!(hdfs_controller, conversion_webhook);
+
+            futures::future::select(hdfs_controller, conversion_webhook).await;
         }
     };
 

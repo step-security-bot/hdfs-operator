@@ -1,5 +1,5 @@
 use snafu::{OptionExt, ResultExt, Snafu};
-use stackable_hdfs_crd::v1::HdfsCluster;
+use stackable_hdfs_crd::HdfsCluster;
 use stackable_hdfs_crd::{DataNodeContainer, MergedConfig, NameNodeContainer};
 use stackable_operator::{
     builder::ConfigMapBuilder,

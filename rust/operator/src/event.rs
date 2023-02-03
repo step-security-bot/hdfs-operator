@@ -1,5 +1,5 @@
 use snafu::{ResultExt, Snafu};
-use stackable_hdfs_crd::v1::HdfsCluster;
+use stackable_hdfs_crd::HdfsCluster;
 use stackable_hdfs_crd::{
     constants::{CONTROLLER_NAME, DEFAULT_DFS_REPLICATION_FACTOR},
     HdfsRole,

@@ -3,3 +3,6 @@
 members = [
     "rust/crd", "rust/operator", "rust/operator-binary"
 ]
+
+[patch]
+stackable-operator = { path = "/home/sliebau/IdeaProjects/stackable/operator-rs" }

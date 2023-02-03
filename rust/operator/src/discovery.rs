@@ -2,7 +2,7 @@ use crate::{
     build_recommended_labels,
     config::{CoreSiteConfigBuilder, HdfsSiteConfigBuilder},
 };
-use stackable_hdfs_crd::v1::HdfsCluster;
+use stackable_hdfs_crd::HdfsCluster;
 use stackable_hdfs_crd::{
     constants::{CORE_SITE_XML, HDFS_SITE_XML},
     HdfsPodRef, HdfsRole,

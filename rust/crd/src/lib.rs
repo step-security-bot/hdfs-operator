@@ -33,7 +33,7 @@ use storage::{
     HdfsStorageConfigFragment, HdfsStorageType,
 };
 use strum::{Display, EnumIter, EnumString};
-use v1::HdfsCluster;
+pub use v1::HdfsCluster;
 
 #[derive(Snafu, Debug)]
 pub enum Error {
@@ -276,6 +276,14 @@ pub mod v1 {
             Ok(result)
         }
     }
+
+    impl TryFrom<v2::HdfsCluster> for HdfsCluster {
+        type Error = ();
+
+        fn try_from(value: v2::HdfsCluster) -> Result<Self, Self::Error> {
+            todo!()
+        }
+    }
 }
 
 pub mod v2 {
@@ -505,6 +513,14 @@ pub mod v2 {
             }
 
             Ok(result)
+        }
+    }
+
+    impl TryFrom<v1::HdfsCluster> for HdfsCluster {
+        type Error = ();
+
+        fn try_from(value: v1::HdfsCluster) -> Result<Self, Self::Error> {
+            todo!()
         }
     }
 }

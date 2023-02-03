@@ -10,6 +10,8 @@ spec:
   zookeeperConfigMapName: simple-hdfs-znode
   dfsReplication: 3
   nameNodes:
+    affinities:
+
     roleGroups:
       default:
         replicas: 2
@@ -21,17 +23,6 @@ spec:
     roleGroups:
       default:
         replicas: 1
-        config:
-          resources:
-            storage:
-              data:
-                count: 2
-                capacity: 1Gi
-                hdfsStorageType: Disk
-              id-backup:
-                count: 1
-                capacity: 10Mi
-                hdfsStorageType: Archive
   journalNodes:
     roleGroups:
       default:
